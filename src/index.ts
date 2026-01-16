@@ -8,6 +8,8 @@ import {
   Tool,
 } from "@modelcontextprotocol/sdk/types.js";
 import axios, { AxiosInstance, AxiosError } from "axios";
+import { Agent as HttpAgent } from "http";
+import { Agent as HttpsAgent } from "https";
 
 // Environment variables
 const SNYK_TOKEN = process.env.SNYK_TOKEN;
@@ -17,6 +19,21 @@ const SNYK_API_VERSION = process.env.SNYK_API_VERSION || "2024-10-15";
 // Base URLs for Snyk APIs
 const REST_API_BASE = "https://api.snyk.io/rest";
 const V1_API_BASE = "https://api.snyk.io/v1";
+
+// HTTP connection pooling agents for performance
+const httpAgent = new HttpAgent({
+  keepAlive: true,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000,
+});
+
+const httpsAgent = new HttpsAgent({
+  keepAlive: true,
+  maxSockets: 50,
+  maxFreeSockets: 10,
+  timeout: 60000,
+});
 
 // API client interfaces
 interface SnykOrg {
@@ -87,6 +104,33 @@ interface SnykTarget {
   };
 }
 
+interface SnykPolicy {
+  id: string;
+  type: string;
+  attributes: {
+    name: string;
+    action_type: string;
+    action?: {
+      ignore_type?: string;
+      reason?: string;
+      expires_at?: string;
+    };
+    conditions_group?: {
+      conditions: Array<{
+        field: string;
+        operator: string;
+        value: string | string[];
+      }>;
+      logical_operator?: string;
+    };
+    review?: {
+      status: string;
+    };
+    created_at?: string;
+    updated_at?: string;
+  };
+}
+
 interface PaginatedResponse<T> {
   data: T[];
   links?: {
@@ -100,36 +144,79 @@ interface PaginatedResponse<T> {
   };
 }
 
-// Create axios instances
-function createRestClient(): AxiosInstance {
+// Credential check helper - returns error message if credentials missing, null if OK
+function checkCredentials(): string | null {
   if (!SNYK_TOKEN) {
-    throw new Error("SNYK_TOKEN environment variable is required");
+    return JSON.stringify({
+      error: "SNYK_TOKEN environment variable is not set",
+      help: "Please set the SNYK_TOKEN environment variable with your Snyk API token. " +
+            "You can find your token at https://app.snyk.io/account or generate one via the Snyk CLI with 'snyk auth'.",
+    }, null, 2);
   }
+  return null;
+}
 
-  return axios.create({
-    baseURL: REST_API_BASE,
-    headers: {
-      "Authorization": `token ${SNYK_TOKEN}`,
-      "Content-Type": "application/vnd.api+json",
-    },
-    params: {
-      version: SNYK_API_VERSION,
-    },
-  });
+// Input validation helper
+function validateRequired(value: unknown, fieldName: string): string | null {
+  if (value === undefined || value === null || value === "") {
+    return JSON.stringify({
+      error: `Missing required parameter: ${fieldName}`,
+      help: `Please provide a valid value for ${fieldName}`,
+    }, null, 2);
+  }
+  return null;
+}
+
+function validateEnum(value: string, fieldName: string, allowedValues: string[]): string | null {
+  if (!allowedValues.includes(value)) {
+    return JSON.stringify({
+      error: `Invalid value for ${fieldName}: ${value}`,
+      help: `Allowed values are: ${allowedValues.join(", ")}`,
+      provided: value,
+    }, null, 2);
+  }
+  return null;
+}
+
+// Singleton client instances for connection reuse (created lazily)
+let restClientInstance: AxiosInstance | null = null;
+let v1ClientInstance: AxiosInstance | null = null;
+
+// Create axios instances - only call these after checking credentials
+// Uses singleton pattern to reuse HTTP connections
+function createRestClient(): AxiosInstance {
+  if (!restClientInstance) {
+    restClientInstance = axios.create({
+      baseURL: REST_API_BASE,
+      headers: {
+        "Authorization": `token ${SNYK_TOKEN}`,
+        "Content-Type": "application/vnd.api+json",
+      },
+      params: {
+        version: SNYK_API_VERSION,
+      },
+      httpAgent,
+      httpsAgent,
+      timeout: 30000,
+    });
+  }
+  return restClientInstance;
 }
 
 function createV1Client(): AxiosInstance {
-  if (!SNYK_TOKEN) {
-    throw new Error("SNYK_TOKEN environment variable is required");
+  if (!v1ClientInstance) {
+    v1ClientInstance = axios.create({
+      baseURL: V1_API_BASE,
+      headers: {
+        "Authorization": `token ${SNYK_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      httpAgent,
+      httpsAgent,
+      timeout: 30000,
+    });
   }
-
-  return axios.create({
-    baseURL: V1_API_BASE,
-    headers: {
-      "Authorization": `token ${SNYK_TOKEN}`,
-      "Content-Type": "application/json",
-    },
-  });
+  return v1ClientInstance;
 }
 
 // Helper to handle pagination
@@ -556,10 +643,129 @@ const tools: Tool[] = [
       required: [],
     },
   },
+  {
+    name: "snyk_list_policies",
+    description: "List all policies for an organization or group",
+    inputSchema: {
+      type: "object",
+      properties: {
+        org_id: {
+          type: "string",
+          description: "The organization ID (uses SNYK_ORG_ID env var if not provided)",
+        },
+        group_id: {
+          type: "string",
+          description: "The group ID (if listing group-level policies)",
+        },
+        limit: {
+          type: "number",
+          description: "Maximum number of policies to return (default: 100)",
+        },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "snyk_get_policy",
+    description: "Get details about a specific policy",
+    inputSchema: {
+      type: "object",
+      properties: {
+        policy_id: {
+          type: "string",
+          description: "The policy ID",
+        },
+        org_id: {
+          type: "string",
+          description: "The organization ID (uses SNYK_ORG_ID env var if not provided)",
+        },
+        group_id: {
+          type: "string",
+          description: "The group ID (if getting a group-level policy)",
+        },
+      },
+      required: ["policy_id"],
+    },
+  },
+  {
+    name: "snyk_create_policy",
+    description: "Create a new policy for an organization or group",
+    inputSchema: {
+      type: "object",
+      properties: {
+        org_id: {
+          type: "string",
+          description: "The organization ID (uses SNYK_ORG_ID env var if not provided)",
+        },
+        group_id: {
+          type: "string",
+          description: "The group ID (if creating a group-level policy)",
+        },
+        name: {
+          type: "string",
+          description: "The policy name",
+        },
+        action_type: {
+          type: "string",
+          description: "The action type (e.g., 'ignore')",
+        },
+        action: {
+          type: "object",
+          description: "Action configuration (e.g., {ignore_type: 'temporary', reason: 'false positive'})",
+        },
+        conditions_group: {
+          type: "object",
+          description: "Conditions group defining when the policy applies",
+        },
+      },
+      required: ["name", "action_type"],
+    },
+  },
+  {
+    name: "snyk_update_policy",
+    description: "Update an existing policy",
+    inputSchema: {
+      type: "object",
+      properties: {
+        policy_id: {
+          type: "string",
+          description: "The policy ID to update",
+        },
+        org_id: {
+          type: "string",
+          description: "The organization ID (uses SNYK_ORG_ID env var if not provided)",
+        },
+        group_id: {
+          type: "string",
+          description: "The group ID (if updating a group-level policy)",
+        },
+        name: {
+          type: "string",
+          description: "The policy name",
+        },
+        action_type: {
+          type: "string",
+          description: "The action type (e.g., 'ignore')",
+        },
+        action: {
+          type: "object",
+          description: "Action configuration",
+        },
+        conditions_group: {
+          type: "object",
+          description: "Conditions group defining when the policy applies",
+        },
+      },
+      required: ["policy_id"],
+    },
+  },
 ];
 
 // Tool handlers
 async function handleVerifyToken(): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
 
   try {
@@ -584,6 +790,9 @@ async function handleVerifyToken(): Promise<string> {
 }
 
 async function handleListOrgs(args: { limit?: number }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const limit = args.limit || 100;
 
@@ -610,6 +819,9 @@ async function handleListOrgs(args: { limit?: number }): Promise<string> {
 }
 
 async function handleGetOrg(args: { org_id?: string }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -641,6 +853,9 @@ async function handleListProjects(args: {
   type?: string;
   limit?: number;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -684,6 +899,9 @@ async function handleListProjects(args: {
 }
 
 async function handleGetProject(args: { org_id?: string; project_id: string }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -722,6 +940,9 @@ async function handleListIssues(args: {
   ignored?: boolean;
   limit?: number;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -770,6 +991,9 @@ async function handleListIssues(args: {
 }
 
 async function handleGetIssue(args: { org_id?: string; issue_id: string }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -802,6 +1026,9 @@ async function handleGetProjectAggregatedIssues(args: {
   include_description?: boolean;
   include_introduced_through?: boolean;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -829,6 +1056,9 @@ async function handleListTargets(args: {
   exclude_empty?: boolean;
   limit?: number;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -871,6 +1101,9 @@ async function handleTestPackage(args: {
   package_name: string;
   package_version: string;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -924,6 +1157,9 @@ async function handleListPackageIssues(args: {
   org_id?: string;
   purl: string;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -954,6 +1190,9 @@ async function handleGetSbom(args: {
   project_id: string;
   format?: string;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const client = createRestClient();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -981,6 +1220,9 @@ async function handleListDependencies(args: {
   org_id?: string;
   project_id: string;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -1022,6 +1264,9 @@ async function handleIgnoreIssue(args: {
   expires_at?: string;
   disregard_if_fixable?: boolean;
 }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -1053,6 +1298,9 @@ async function handleIgnoreIssue(args: {
 }
 
 async function handleActivateProject(args: { org_id?: string; project_id: string }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -1073,6 +1321,9 @@ async function handleActivateProject(args: { org_id?: string; project_id: string
 }
 
 async function handleDeactivateProject(args: { org_id?: string; project_id: string }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -1093,6 +1344,9 @@ async function handleDeactivateProject(args: { org_id?: string; project_id: stri
 }
 
 async function handleGetOrgEntitlements(args: { org_id?: string }): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
   const v1Client = createV1Client();
   const orgId = args.org_id || SNYK_ORG_ID;
 
@@ -1104,6 +1358,206 @@ async function handleGetOrgEntitlements(args: { org_id?: string }): Promise<stri
     const response = await v1Client.get(`/org/${orgId}/entitlements`);
 
     return JSON.stringify(response.data, null, 2);
+  } catch (error) {
+    return JSON.stringify({ error: formatError(error) }, null, 2);
+  }
+}
+
+async function handleListPolicies(args: {
+  org_id?: string;
+  group_id?: string;
+  limit?: number;
+}): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
+  const client = createRestClient();
+  const limit = args.limit || 100;
+
+  let baseUrl: string;
+  if (args.group_id) {
+    baseUrl = `/groups/${args.group_id}/policies`;
+  } else {
+    const orgId = args.org_id || SNYK_ORG_ID;
+    if (!orgId) {
+      return JSON.stringify({ error: "org_id or group_id is required (set SNYK_ORG_ID or provide org_id/group_id parameter)" }, null, 2);
+    }
+    baseUrl = `/orgs/${orgId}/policies`;
+  }
+
+  try {
+    const policies = await fetchAllPages<SnykPolicy>(
+      client,
+      `${baseUrl}?limit=${Math.min(limit, 100)}`,
+      Math.ceil(limit / 100)
+    );
+
+    return JSON.stringify({
+      count: policies.length,
+      policies: policies.slice(0, limit).map(policy => ({
+        id: policy.id,
+        name: policy.attributes.name,
+        action_type: policy.attributes.action_type,
+        action: policy.attributes.action,
+        conditions_group: policy.attributes.conditions_group,
+        review: policy.attributes.review,
+        created_at: policy.attributes.created_at,
+        updated_at: policy.attributes.updated_at,
+      })),
+    }, null, 2);
+  } catch (error) {
+    return JSON.stringify({ error: formatError(error) }, null, 2);
+  }
+}
+
+async function handleGetPolicy(args: {
+  policy_id: string;
+  org_id?: string;
+  group_id?: string;
+}): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
+  const client = createRestClient();
+
+  let url: string;
+  if (args.group_id) {
+    url = `/groups/${args.group_id}/policies/${args.policy_id}`;
+  } else {
+    const orgId = args.org_id || SNYK_ORG_ID;
+    if (!orgId) {
+      return JSON.stringify({ error: "org_id or group_id is required (set SNYK_ORG_ID or provide org_id/group_id parameter)" }, null, 2);
+    }
+    url = `/orgs/${orgId}/policies/${args.policy_id}`;
+  }
+
+  try {
+    const response = await client.get(url);
+    const policy = response.data.data;
+
+    return JSON.stringify({
+      id: policy.id,
+      name: policy.attributes.name,
+      action_type: policy.attributes.action_type,
+      action: policy.attributes.action,
+      conditions_group: policy.attributes.conditions_group,
+      review: policy.attributes.review,
+      created_at: policy.attributes.created_at,
+      updated_at: policy.attributes.updated_at,
+    }, null, 2);
+  } catch (error) {
+    return JSON.stringify({ error: formatError(error) }, null, 2);
+  }
+}
+
+async function handleCreatePolicy(args: {
+  org_id?: string;
+  group_id?: string;
+  name: string;
+  action_type: string;
+  action?: Record<string, unknown>;
+  conditions_group?: Record<string, unknown>;
+}): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
+  const client = createRestClient();
+
+  let url: string;
+  if (args.group_id) {
+    url = `/groups/${args.group_id}/policies`;
+  } else {
+    const orgId = args.org_id || SNYK_ORG_ID;
+    if (!orgId) {
+      return JSON.stringify({ error: "org_id or group_id is required (set SNYK_ORG_ID or provide org_id/group_id parameter)" }, null, 2);
+    }
+    url = `/orgs/${orgId}/policies`;
+  }
+
+  try {
+    const payload = {
+      data: {
+        type: "policy",
+        attributes: {
+          name: args.name,
+          action_type: args.action_type,
+          ...(args.action && { action: args.action }),
+          ...(args.conditions_group && { conditions_group: args.conditions_group }),
+        },
+      },
+    };
+
+    const response = await client.post(url, payload);
+    const policy = response.data.data;
+
+    return JSON.stringify({
+      success: true,
+      policy: {
+        id: policy.id,
+        name: policy.attributes.name,
+        action_type: policy.attributes.action_type,
+        action: policy.attributes.action,
+        conditions_group: policy.attributes.conditions_group,
+      },
+    }, null, 2);
+  } catch (error) {
+    return JSON.stringify({ error: formatError(error) }, null, 2);
+  }
+}
+
+async function handleUpdatePolicy(args: {
+  policy_id: string;
+  org_id?: string;
+  group_id?: string;
+  name?: string;
+  action_type?: string;
+  action?: Record<string, unknown>;
+  conditions_group?: Record<string, unknown>;
+}): Promise<string> {
+  const credError = checkCredentials();
+  if (credError) return credError;
+
+  const client = createRestClient();
+
+  let url: string;
+  if (args.group_id) {
+    url = `/groups/${args.group_id}/policies/${args.policy_id}`;
+  } else {
+    const orgId = args.org_id || SNYK_ORG_ID;
+    if (!orgId) {
+      return JSON.stringify({ error: "org_id or group_id is required (set SNYK_ORG_ID or provide org_id/group_id parameter)" }, null, 2);
+    }
+    url = `/orgs/${orgId}/policies/${args.policy_id}`;
+  }
+
+  try {
+    const payload = {
+      data: {
+        type: "policy",
+        id: args.policy_id,
+        attributes: {
+          ...(args.name && { name: args.name }),
+          ...(args.action_type && { action_type: args.action_type }),
+          ...(args.action && { action: args.action }),
+          ...(args.conditions_group && { conditions_group: args.conditions_group }),
+        },
+      },
+    };
+
+    const response = await client.patch(url, payload);
+    const policy = response.data.data;
+
+    return JSON.stringify({
+      success: true,
+      policy: {
+        id: policy.id,
+        name: policy.attributes.name,
+        action_type: policy.attributes.action_type,
+        action: policy.attributes.action,
+        conditions_group: policy.attributes.conditions_group,
+        updated_at: policy.attributes.updated_at,
+      },
+    }, null, 2);
   } catch (error) {
     return JSON.stringify({ error: formatError(error) }, null, 2);
   }
@@ -1233,6 +1687,41 @@ async function main() {
           break;
         case "snyk_get_org_entitlements":
           result = await handleGetOrgEntitlements(args as { org_id?: string });
+          break;
+        case "snyk_list_policies":
+          result = await handleListPolicies(args as {
+            org_id?: string;
+            group_id?: string;
+            limit?: number;
+          });
+          break;
+        case "snyk_get_policy":
+          result = await handleGetPolicy(args as {
+            policy_id: string;
+            org_id?: string;
+            group_id?: string;
+          });
+          break;
+        case "snyk_create_policy":
+          result = await handleCreatePolicy(args as {
+            org_id?: string;
+            group_id?: string;
+            name: string;
+            action_type: string;
+            action?: Record<string, unknown>;
+            conditions_group?: Record<string, unknown>;
+          });
+          break;
+        case "snyk_update_policy":
+          result = await handleUpdatePolicy(args as {
+            policy_id: string;
+            org_id?: string;
+            group_id?: string;
+            name?: string;
+            action_type?: string;
+            action?: Record<string, unknown>;
+            conditions_group?: Record<string, unknown>;
+          });
           break;
         default:
           return {
